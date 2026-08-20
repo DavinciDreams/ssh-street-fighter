@@ -51,7 +51,7 @@ for (let i = 2; i < process.argv.length; i++) {
 
 if (args.help) {
   console.log(`Usage:
-  node examples/bot.mjs [--user NAME] [--host HOST] [--char FIGHTER] [--identity KEY]
+  node examples/bot.mjs [--user NAME] [--host HOST] [--char FIGHTER] [--identity KEY] [--max-matches N]
   node examples/bot.mjs --tcp HOST:PORT --key rk_xxx [--char FIGHTER]
 
 Options:
@@ -59,13 +59,14 @@ Options:
   --user NAME     SSH username (default: BOT).
   --host HOST     SSH host (default: sshfighter.com).
   --char FIGHTER  Fighter to queue as (default: BYU).
+  --max-matches N Stop after N completed matches.
   --tcp HOST:PORT Use direct TCP instead of the recommended SSH transport.
   --key TOKEN     API key required by direct TCP.
   --help          Show this help.`);
   process.exit(0);
 }
 
-for (const name of ['identity', 'user', 'host', 'char', 'tcp', 'key']) {
+for (const name of ['identity', 'user', 'host', 'char', 'tcp', 'key', 'max-matches', 'policy']) {
   if (args[name] === true) {
     console.error(`--${name} requires a value`);
     process.exit(2);
@@ -75,6 +76,8 @@ for (const name of ['identity', 'user', 'host', 'char', 'tcp', 'key']) {
 const CHAR = args.char || 'BYU';
 const HOST = args.host || 'sshfighter.com';
 const USER = args.user || 'BOT';
+const MAX_MATCHES = args['max-matches'] ? Math.max(1, parseInt(String(args['max-matches']), 10) || 1) : Infinity;
+const POLICY_VERSION = args.policy || 'example-fable-v1';
 
 // ---- transport: SSH `play` (default) or direct TCP with an API key ----
 let toGame;          // write a JSON object to the game
@@ -115,6 +118,29 @@ function decide(st) {
   const oppAir = opp.y > 8;
   const oppAttacking = opp.attack && opp.attack !== 'none';
 
+  if (CHAR.toUpperCase() === 'FABLE') {
+    const back = f === 1 ? 'L' : 'R';
+    const forward = f === 1 ? 'R' : 'L';
+    if (oppAir && dist < 70) {                           // Story Arc checks jump-ins
+      cmd.motion = 'DU'; cmd.punch = true;
+    } else if (oppAttacking && dist < 62) {
+      cmd.moveX = -towards;                              // respect active frames
+      if (R() < 0.12) { cmd.motion = `${back}${forward}`; cmd.kick = true; }
+    } else if (dist < 38) {
+      if (R() < 0.45) cmd.punch = true; else if (R() < 0.85) cmd.kick = true;
+      else { cmd.motion = `${back}${forward}`; cmd.kick = true; }
+    } else if (dist < 105) {
+      cmd.moveX = towards;
+      if (R() < 0.08) { cmd.motion = `${back}${forward}`; cmd.kick = true; }  // Plot Twist
+      else if (R() < 0.05) { cmd.motion = `D${back}`; cmd.punch = true; }     // Ink Tempest
+    } else {
+      if (R() < 0.26) { cmd.motion = `D${back}`; cmd.punch = true; }          // Ink Tempest zoning
+      else cmd.moveX = towards;
+      if (R() < 0.025) cmd.jump = true;
+    }
+    return cmd;
+  }
+
   if (oppAir && dist < 58) {                            // anti-air: dragon punch a jump-in
     cmd.motion = f === 1 ? 'RDR' : 'LDL'; cmd.punch = true;
   } else if (dist < 42) {                               // point blank: block or strike
@@ -133,6 +159,31 @@ function decide(st) {
 
 // ---- drive the connection ----
 let wins = 0, losses = 0;
+let roster = [];
+let ownName = USER;
+let current = null;
+function freshCounts() {
+  return {
+    states: 0, inputs: 0, walkToward: 0, block: 0, punch: 0, kick: 0, jump: 0,
+    neutral: 0, specials: {}, motions: {},
+  };
+}
+function countDecision(st, cmd) {
+  if (!current) return;
+  current.counts.states++;
+  current.counts.inputs++;
+  if (cmd.moveX) current.counts.walkToward++;
+  if (cmd.jump) current.counts.jump++;
+  if (cmd.punch) current.counts.punch++;
+  if (cmd.kick) current.counts.kick++;
+  if (!cmd.moveX && !cmd.jump && !cmd.punch && !cmd.kick) current.counts.neutral++;
+  if (st?.opp?.attack && st.opp.attack !== 'none' && cmd.moveX) current.counts.block++;
+  if (cmd.motion && cmd.motion !== 'N') {
+    current.counts.motions[cmd.motion] = (current.counts.motions[cmd.motion] || 0) + 1;
+    const special = `${cmd.motion}${cmd.punch ? '+P' : cmd.kick ? '+K' : ''}`;
+    current.counts.specials[special] = (current.counts.specials[special] || 0) + 1;
+  }
+}
 lineSource.on('line', (line) => {
   line = line.trim(); if (!line || line[0] !== '{') return;
   let msg; try { msg = JSON.parse(line); } catch { return; }
@@ -141,15 +192,59 @@ lineSource.on('line', (line) => {
       if (!preAuthed) toGame({ t: 'hello', key: args.key });
       break;
     case 'welcome':
+      roster = Array.isArray(msg.roster) ? msg.roster : [];
+      ownName = msg.name || USER;
       console.log(`connected as ${msg.name} (elo ${msg.elo}) — queueing as ${CHAR}`);
       toGame({ t: 'queue', char: CHAR });
       break;
     case 'queued': console.log(`in queue as ${msg.char}…`); break;
-    case 'matchStart': console.log(`match! you are ${msg.role} on ${msg.stage} vs ${msg.oppName}`); break;
-    case 'state': toGame(decide(msg)); break;
+    case 'matchStart':
+      current = {
+        matchId: msg.mid,
+        handle: ownName,
+        character: CHAR,
+        opponentHandle: msg.oppName,
+        opponentCharacter: roster[msg.oppCursor] || String(msg.oppCursor ?? 'unknown'),
+        policyVersion: POLICY_VERSION,
+        map: msg.stage,
+        role: msg.role,
+        counts: freshCounts(),
+        lastState: null,
+      };
+      console.log(`match! ${msg.mid} you are ${msg.role} on ${msg.stage} vs ${msg.oppName}/${current.opponentCharacter}`);
+      break;
+    case 'state': {
+      if (current) current.lastState = msg;
+      const cmd = decide(msg);
+      countDecision(msg, cmd);
+      toGame(cmd);
+      break;
+    }
     case 'matchEnd':
       msg.result?.youWon ? wins++ : losses++;
-      console.log(`match over — ${msg.result?.youWon ? 'WON' : 'lost'} (record ${wins}-${losses}). requeueing…`);
+      if (current) {
+        const st = current.lastState;
+        const youRounds = st?.you?.wins ?? null;
+        const oppRounds = st?.opp?.wins ?? null;
+        console.log(JSON.stringify({
+          t: 'blockResult',
+          match_id: current.matchId,
+          handle: current.handle,
+          character: current.character,
+          opponent_handle: current.opponentHandle,
+          opponent_character: current.opponentCharacter,
+          policy_version: current.policyVersion,
+          map: current.map,
+          round_score: youRounds === null || oppRounds === null ? null : `${youRounds}-${oppRounds}`,
+          outcome: msg.result?.youWon ? 'win' : 'loss',
+          elo_delta: msg.result?.rating?.delta ?? null,
+          decision_counts: current.counts,
+        }));
+        current = null;
+      }
+      console.log(`match over — ${msg.result?.youWon ? 'WON' : 'lost'} (record ${wins}-${losses}).`);
+      if (wins + losses >= MAX_MATCHES) process.exit(0);
+      console.log('requeueing…');
       setTimeout(() => toGame({ t: 'queue', char: CHAR }), 800);
       break;
     case 'error': console.error('server error:', msg.msg); break;
